@@ -36,17 +36,56 @@ A Playwright-based Python tool that bypasses search engine anti-scraping mechani
 
 ## Installation
 
+### With uv (recommended)
+
+The project ships a `pyproject.toml`, so [uv](https://docs.astral.sh/uv/) can
+manage the environment and expose console scripts.
+
+```bash
+git clone https://github.com/iwanghc/mcp_web_search.git
+cd mcp_web_search
+
+uv sync                              # create .venv and install dependencies
+uv run playwright install chromium   # install the browser (one time)
+
+uv run mcp-web-search-cli "search keywords"   # run the CLI
+uv run mcp-web-search                          # run the MCP server (stdio)
+```
+
+#### Run without cloning
+
+Because the package is installable from Git, you can run it without cloning the
+repository first. uv fetches and builds it into its own cache:
+
+```bash
+# Ephemeral run
+uvx --from git+https://github.com/iwanghc/mcp_web_search.git@main mcp-web-search-cli "search keywords"
+
+# Or install persistently so the console scripts land on your PATH
+uv tool install git+https://github.com/iwanghc/mcp_web_search.git@main
+mcp-web-search-cli "search keywords"
+```
+
+Playwright browsers are shared via the default cache (`~/.cache/ms-playwright`),
+so a `playwright install chromium` run once on the machine is reused by every
+environment.
+
+### With pip
+
 ```bash
 # Install from source
 git clone https://github.com/iwanghc/mcp_web_search.git
 cd mcp_web_search
 
 # Install Python dependencies
-pip install -r requirements.txt
+pip install -r requirements.txt     # or: pip install .
 
 # Install Playwright browsers
 playwright install chromium
 ```
+
+> Requires **mcp >= 2** (the server targets the MCP Python SDK v2 API). The
+> package itself requires Python 3.11+.
 
 ## Usage
 
@@ -147,13 +186,85 @@ If you use the `--save-html` option, the output will include `saved_path` and po
 
 This project provides Model Context Protocol (MCP) server functionality, allowing AI assistants like Claude to directly use Google search capabilities. MCP is an open protocol that enables AI assistants to securely access external tools and data.
 
-#### Integration with Claude Desktop
+The server runs over **stdio by default** — the MCP client launches the process
+on demand and talks to it over stdin/stdout, so there is no standing HTTP server
+to manage. (An optional HTTP/SSE mode is available; see
+[Recent Changes](#recent-changes).)
 
-1. Edit Claude Desktop configuration file
-   - Mac: `~/Library/Application Support/Claude/claude_desktop_config.json`
-   - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+#### Available tools
 
-2. Add server configuration and restart Claude. Example uses module invocation so Claude runs the MCP server process:
+| Tool | Description |
+| --- | --- |
+| `google-search` | Run a Google search and return structured results (title, link, snippet). |
+| `get-webpage-html` | Perform a search and return the cleaned HTML of the results page, with an optional screenshot. |
+| `get-webpage-markdown` | Visit a URL and distill it to Markdown. Supports a `backend` option (see below). |
+| `google-search-and-browse` | Search, then visit the top N result pages and return distilled Markdown for each. |
+
+##### `get-webpage-markdown` backends
+
+`get-webpage-markdown` accepts a `backend` argument:
+
+- `"playwright"` (default) — the built-in stealth Playwright + Crawl4AI distiller.
+- `"agent-browser"` — shells out to the external
+  [agent-browser](https://www.npmjs.com/package/agent-browser) CLI (Chrome over
+  CDP). Set `renderJs: false` for a lighter HTTP-only fetch. This backend
+  requires the Node CLI on `PATH`:
+
+  ```bash
+  npm i -g agent-browser && agent-browser install
+  ```
+
+  Override the binary location with the `AGENT_BROWSER_BIN` environment variable.
+
+#### Integration with Claude Desktop / Claude Code
+
+Edit the Claude Desktop configuration file:
+- Mac: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+
+Add a server entry and restart Claude. Pick whichever launcher matches your
+installation:
+
+**Run from a local checkout with uv** (`--directory` sets the working directory
+so `logs/`, `user_data/`, and `browser-state.json` land in the project):
+
+```json
+{
+  "mcpServers": {
+    "google-search": {
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/mcp_web_search", "--no-sync", "mcp-web-search"]
+    }
+  }
+}
+```
+
+**Run without cloning, straight from Git:**
+
+```json
+{
+  "mcpServers": {
+    "google-search": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/iwanghc/mcp_web_search.git@main", "mcp-web-search"]
+    }
+  }
+}
+```
+
+**After `uv tool install` (or `pip install .`)**, the console script is on PATH:
+
+```json
+{
+  "mcpServers": {
+    "google-search": {
+      "command": "mcp-web-search"
+    }
+  }
+}
+```
+
+**Plain module invocation** (no packaging; run from the project directory):
 
 ```json
 {
@@ -166,7 +277,15 @@ This project provides Model Context Protocol (MCP) server functionality, allowin
 }
 ```
 
-After integration, you can directly use search functionality in Claude, such as "Search for the latest AI research".
+For Claude Code, the same can be registered in one command:
+
+```bash
+claude mcp add google-search -- uvx --from git+https://github.com/iwanghc/mcp_web_search.git@main mcp-web-search
+```
+
+On start the client sends `initialize` and then `list_tools`, which returns the
+four tools above. After integration, you can directly use search functionality
+in Claude, such as "Search for the latest AI research".
 
 ## Project Structure
 
@@ -179,6 +298,8 @@ google_search/
 │   │   ├── search_executor.py     # Search execution logic
 │   │   ├── html_extractor.py      # HTML parsing and extraction
 │   │   ├── fingerprint.py         # Browser fingerprint management
+│   │   ├── distiller.py           # Content distillation to Markdown
+│   │   ├── agent_browser_backend.py # Optional agent-browser CLI backend
 │   │   ├── utils.py               # Utility functions
 │   │   └── __init__.py            # Package initialization
 │   └── cli.py                     # Command line interface
@@ -193,7 +314,8 @@ google_search/
 │   │   ├── types.py               # Common data types
 │   │   └── __init__.py            # Package initialization
 ├── Configuration & Runtime/
-│   ├── requirements.txt            # Python dependencies
+│   ├── pyproject.toml              # Packaging, dependencies, console scripts
+│   ├── requirements.txt            # Python dependencies (pip/Docker workflows)
 │   ├── dotenv.env                  # Environment variables
 │   ├── browser-state.json          # Browser state persistence
 │   ├── browser-state-fingerprint.json # Browser fingerprint data
@@ -211,30 +333,41 @@ google_search/
 
 ## Technology Stack
 
-- **Python 3.8+**: Development language, providing excellent performance and compatibility
+- **Python 3.11+**: Development language, providing excellent performance and compatibility
 - **Playwright**: For browser automation, supporting multiple browsers
-- **MCP SDK**: For implementing MCP server development tools
+- **MCP SDK v2** (`mcp >= 2`): For implementing MCP server development tools
+- **agent-browser (optional)**: External Node CLI used as an alternative page-fetching backend
 - **asyncio**: Python's standard library for asynchronous I/O
 - **aiofiles**: Asynchronous file operations
 
 ## Development Guide
 
-All commands can be run in the project root directory:
+All commands can be run in the project root directory. With uv:
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Install dependencies into .venv
+uv sync
 
 # Install Playwright browsers (when running locally)
-playwright install chromium
+uv run playwright install chromium
 
 # Run CLI tool
-python cli.py "search keywords"
+uv run mcp-web-search-cli "search keywords"
 
-# Start MCP server (SSE/HTTP mode or stdio transport depending on env)
-python -m mcp_integration.server
+# Start MCP server (stdio by default; SSE/HTTP when MCP_SSE=1)
+uv run mcp-web-search
 
 # Test MCP client
+uv run python -m mcp_integration.client
+```
+
+The equivalent plain-Python / pip commands also work:
+
+```bash
+pip install -r requirements.txt
+playwright install chromium
+python cli.py "search keywords"
+python -m mcp_integration.server
 python -m mcp_integration.client
 ```
 
@@ -336,6 +469,18 @@ Security & Compliance:
 
 ## Recent Changes
 
+- Added a `pyproject.toml` so the project is installable with uv or pip, exposing
+  the `mcp-web-search` (server) and `mcp-web-search-cli` (CLI) console scripts.
+  This enables running the MCP server directly in an `mcpServers` config over
+  stdio, and even without cloning via `uvx`/`uv tool install` from Git.
+- Migrated the MCP server to the **MCP Python SDK v2** API (`mcp >= 2`). Tool
+  handlers are now wired via `Server(..., on_list_tools=, on_call_tool=)` and
+  return `ListToolsResult` / `CallToolResult` instead of the removed v1
+  decorators.
+- Added an `agent-browser` backend for the `get-webpage-markdown` tool as an
+  alternative to the built-in Playwright/Crawl4AI distiller. Select it with
+  `backend: "agent-browser"` (optionally `renderJs: false`). It requires the
+  external agent-browser Node CLI on `PATH`.
 - Removed the top-level `Dockerfile`; use `Dockerfile.ubuntu` for building the Ubuntu-based image.
 - MCP server now supports HTTP/SSE mode (Starlette + `SseServerTransport`). To run in SSE mode:
 
