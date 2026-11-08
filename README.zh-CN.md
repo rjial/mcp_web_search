@@ -36,17 +36,52 @@
 
 ## 安装
 
+### 使用 uv（推荐）
+
+项目提供了 `pyproject.toml`，可用 [uv](https://docs.astral.sh/uv/) 管理环境并暴露命令行脚本。
+
+```bash
+git clone https://github.com/iwanghc/mcp_web_search.git
+cd mcp_web_search
+
+uv sync                              # 创建 .venv 并安装依赖
+uv run playwright install chromium   # 安装浏览器（仅需一次）
+
+uv run mcp-web-search-cli "搜索关键词"   # 运行 CLI
+uv run mcp-web-search                     # 运行 MCP 服务器（stdio）
+```
+
+#### 无需克隆直接运行
+
+由于本包可从 Git 直接安装，你无需先克隆仓库即可运行。uv 会把它拉取并构建到自己的缓存中：
+
+```bash
+# 临时运行
+uvx --from git+https://github.com/iwanghc/mcp_web_search.git@main mcp-web-search-cli "搜索关键词"
+
+# 或持久化安装，使命令行脚本进入 PATH
+uv tool install git+https://github.com/iwanghc/mcp_web_search.git@main
+mcp-web-search-cli "搜索关键词"
+```
+
+Playwright 浏览器通过默认缓存（`~/.cache/ms-playwright`）共享，因此在本机执行一次
+`playwright install chromium` 后，所有环境都可复用。
+
+### 使用 pip
+
 ```bash
 # 从源码安装
 git clone https://github.com/iwanghc/mcp_web_search.git
 cd mcp_web_search
 
 # 安装Python依赖
-pip install -r requirements.txt
+pip install -r requirements.txt     # 或：pip install .
 
 # 安装Playwright浏览器
 playwright install chromium
 ```
+
+> 需要 **mcp >= 2**（服务器面向 MCP Python SDK v2 API）。本包要求 Python 3.11+。
 
 ## 使用方法
 
@@ -64,7 +99,18 @@ python cli.py --get-html "搜索关键词"
 
 # 获取HTML并保存到文件
 python cli.py --get-html --save-html "搜索关键词"
+
+# 将某个 URL 提炼为 Markdown（默认 playwright 后端）
+python cli.py --markdown https://example.com
+
+# 使用 agent-browser 后端将 URL 提炼为 Markdown
+python cli.py --markdown https://example.com --backend agent-browser
+
+# agent-browser，更轻量的纯 HTTP 抓取（不启动 Chrome / 不执行 JS）
+python cli.py --markdown https://example.com --backend agent-browser --no-render-js
 ```
+
+使用 `--markdown` 时，位置参数 `query` 变为可选；若提供，则作为提炼器的意图/过滤提示。
 
 ### MCP服务器
 
@@ -79,12 +125,16 @@ python -m mcp_integration.client
 - `-l, --limit <number>`: 结果数量限制（默认：10）
 - `-t, --timeout <number>`: 超时时间（毫秒，默认：30000）
 - `--no-headless`: 显示浏览器界面（调试用）
-- `--remote-debugging-port <number>`: 启用远程调试端口（默认：9222）
 - `--state-file <path>`: 浏览器状态文件路径（默认：./browser-state.json）
 - `--no-save-state`: 不保存浏览器状态
+- `-b, --basic-view, --gbv`: 使用 Google Basic Variant（gbv=1）
+- `--manual-captcha`: 允许交互式手动解答人机验证
 - `--get-html`: 获取搜索结果页面的原始HTML而不是解析结果
 - `--save-html`: 将HTML保存到文件（与--get-html一起使用）
 - `--html-output <path>`: 指定HTML输出文件路径（与--get-html和--save-html一起使用）
+- `--markdown <URL>`: 抓取指定 URL 并提炼为 Markdown，而非执行搜索
+- `--backend <playwright|agent-browser>`: `--markdown` 的抓取后端（默认：playwright）
+- `--render-js / --no-render-js`: 仅 agent-browser 后端——启动 Chrome 以执行 JS（默认：开启）
 - `-V, --version`: 显示版本号
 - `-h, --help`: 显示帮助信息
 
@@ -146,28 +196,101 @@ python -m mcp_integration.client
 
 本项目提供 Model Context Protocol (MCP) 服务器功能，让 Claude 等 AI 助手直接使用 Google 搜索能力。MCP 是一个开放协议，使 AI 助手能安全访问外部工具和数据。
 
-#### 与 Claude Desktop 集成
+服务器**默认通过 stdio 运行**——由 MCP 客户端按需启动进程并经由 stdin/stdout 通信，因此无需维护常驻的 HTTP 服务器。（另提供可选的 HTTP/SSE 模式，见[最近更新](#最近更新)。）
 
-1. 编辑 Claude Desktop 配置文件
-   - Mac: `~/Library/Application Support/Claude/claude_desktop_config.json`
-   - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-     - 通常位于 `C:\Users\用户名\AppData\Roaming\Claude\claude_desktop_config.json`
-     - 可以在 Windows 资源管理器地址栏输入 `%APPDATA%\Claude` 直接访问
+#### 可用工具
 
-2. 添加服务器配置并重启 Claude
+| 工具 | 说明 |
+| --- | --- |
+| `google-search` | 执行 Google 搜索并返回结构化结果（标题、链接、摘要）。 |
+| `get-webpage-html` | 执行搜索并返回结果页面清理后的 HTML，可选截图。 |
+| `get-webpage-markdown` | 访问某个 URL 并提炼为 Markdown。支持 `backend` 选项（见下）。 |
+| `google-search-and-browse` | 先搜索，再访问前 N 个结果页面，并为每个返回提炼后的 Markdown。 |
+
+##### `get-webpage-markdown` 的后端
+
+`get-webpage-markdown` 接受 `backend` 参数：
+
+- `"playwright"`（默认）——内置的隐身 Playwright + Crawl4AI 提炼器。
+- `"agent-browser"`——调用外部
+  [agent-browser](https://www.npmjs.com/package/agent-browser) 命令行工具（通过 CDP
+  控制 Chrome）。设置 `renderJs: false` 可使用更轻量的纯 HTTP 抓取。该后端需要
+  Node 命令行工具位于 `PATH` 中：
+
+  ```bash
+  npm i -g agent-browser && agent-browser install
+  ```
+
+  可用 `AGENT_BROWSER_BIN` 环境变量覆盖二进制路径。
+
+#### 与 Claude Desktop / Claude Code 集成
+
+编辑 Claude Desktop 配置文件：
+- Mac: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+
+添加服务器配置并重启 Claude，按安装方式选择启动器：
+
+**使用 uv 从本地检出运行**（`--directory` 设置工作目录，使 `logs/`、`user_data/`、
+`browser-state.json` 落在项目内）：
+
+```json
+{
+  "mcpServers": {
+    "google-search": {
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/mcp_web_search", "--no-sync", "mcp-web-search"]
+    }
+  }
+}
+```
+
+**无需克隆，直接从 Git 运行：**
+
+```json
+{
+  "mcpServers": {
+    "google-search": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/iwanghc/mcp_web_search.git@main", "mcp-web-search"]
+    }
+  }
+}
+```
+
+**在 `uv tool install`（或 `pip install .`）之后**，命令行脚本已在 PATH 中：
+
+```json
+{
+  "mcpServers": {
+    "google-search": {
+      "command": "mcp-web-search"
+    }
+  }
+}
+```
+
+**普通模块调用**（不打包；在项目目录中运行）：
 
 ```json
 {
   "mcpServers": {
     "google-search": {
       "command": "python",
-      "args": ["mcp_server_simple.py"]
+      "args": ["-m", "mcp_integration.server"]
     }
   }
 }
 ```
 
-集成后，可在 Claude 中直接使用搜索功能，如"搜索最新的 AI 研究"。
+Claude Code 中可用一条命令注册：
+
+```bash
+claude mcp add google-search -- uvx --from git+https://github.com/iwanghc/mcp_web_search.git@main mcp-web-search
+```
+
+启动时客户端发送 `initialize`，随后 `list_tools` 返回上述四个工具。集成后，可在 Claude
+中直接使用搜索功能，如"搜索最新的 AI 研究"。
 
 ## 项目结构
 
@@ -180,6 +303,8 @@ google-search/
 │   │   ├── search_executor.py     # 搜索执行逻辑
 │   │   ├── html_extractor.py      # HTML解析和提取
 │   │   ├── fingerprint.py         # 浏览器指纹管理
+│   │   ├── distiller.py           # 内容提炼为 Markdown
+│   │   ├── agent_browser_backend.py # 可选的 agent-browser 命令行后端
 │   │   ├── utils.py               # 工具函数
 │   │   └── __init__.py            # 包初始化
 │   └── cli.py                     # 命令行接口
@@ -194,7 +319,8 @@ google-search/
 │   │   ├── types.py               # 通用数据类型
 │   │   └── __init__.py            # 包初始化
 ├── 配置和运行时/
-│   ├── requirements.txt            # Python依赖
+│   ├── pyproject.toml              # 打包、依赖、命令行脚本
+│   ├── requirements.txt            # Python依赖（pip/Docker 流程）
 │   ├── dotenv.env                  # 环境变量
 │   ├── browser-state.json          # 浏览器状态持久化
 │   ├── browser-state-fingerprint.json # 浏览器指纹数据
@@ -212,31 +338,42 @@ google-search/
 
 ## 技术栈
 
-- **Python 3.8+**: 开发语言，提供优秀的性能和兼容性
+- **Python 3.11+**: 开发语言，提供优秀的性能和兼容性
 - **Playwright**: 用于浏览器自动化，支持多种浏览器
-- **MCP SDK**: 用于实现MCP服务器的开发工具
+- **MCP SDK v2**（`mcp >= 2`）: 用于实现MCP服务器的开发工具
+- **agent-browser（可选）**: 外部 Node 命令行工具，作为可选的网页抓取后端
 - **asyncio**: Python标准库的异步I/O
 - **aiofiles**: 异步文件操作
 
 ## 开发指南
 
-所有命令都可以在项目根目录下运行：
+所有命令都可以在项目根目录下运行。使用 uv：
 
 ```bash
-# 安装依赖
-pip install -r requirements.txt
+# 将依赖安装到 .venv
+uv sync
 
-# 安装Playwright浏览器
-playwright install chromium
+# 安装Playwright浏览器（本地运行时）
+uv run playwright install chromium
 
 # 运行CLI工具
-python cli.py "搜索关键词"
+uv run mcp-web-search-cli "搜索关键词"
 
-# 启动MCP服务器
-python mcp_server_simple.py
+# 启动MCP服务器（默认 stdio；MCP_SSE=1 时为 SSE/HTTP）
+uv run mcp-web-search
 
 # 测试MCP客户端
-python mcp_client_enhanced.py
+uv run python -m mcp_integration.client
+```
+
+等效的普通 Python / pip 命令同样可用：
+
+```bash
+pip install -r requirements.txt
+playwright install chromium
+python cli.py "搜索关键词"
+python -m mcp_integration.server
+python -m mcp_integration.client
 ```
 
 ## 错误处理
@@ -314,3 +451,24 @@ python mcp_client_enhanced.py
 - **并发支持**：支持异步操作
 - **内存使用**：优化，每次调用后清理
 - **稳定性**：健壮的错误恢复和超时处理
+
+## 最近更新
+
+- 新增 `pyproject.toml`，使项目可用 uv 或 pip 安装，并暴露 `mcp-web-search`（服务器）
+  与 `mcp-web-search-cli`（CLI）命令行脚本。由此可直接在 `mcpServers` 配置中以 stdio
+  运行 MCP 服务器，甚至无需克隆，通过 `uvx` / `uv tool install` 从 Git 运行。
+- 将 MCP 服务器迁移到 **MCP Python SDK v2** API（`mcp >= 2`）。工具处理器现经由
+  `Server(..., on_list_tools=, on_call_tool=)` 注册，并返回 `ListToolsResult` /
+  `CallToolResult`，取代已移除的 v1 装饰器。
+- 为 `get-webpage-markdown` 工具新增 `agent-browser` 后端，作为内置 Playwright/Crawl4AI
+  提炼器的替代。通过 `backend: "agent-browser"`（可选 `renderJs: false`）选择。需要外部
+  agent-browser Node 命令行工具位于 `PATH` 中。
+- CLI 新增 `--markdown <URL>` 与 `--backend playwright|agent-browser` 选项（以及
+  `--render-js/--no-render-js`），可在命令行执行网页 Markdown 提炼。
+- 服务器支持 HTTP/SSE 模式（Starlette + `SseServerTransport`）：
+
+  ```bash
+  MCP_SSE=1 MCP_SSE_HOST=0.0.0.0 MCP_SSE_PORT=8000 python -m mcp_integration.server
+  ```
+
+  并在 `http://<host>:<port>/health` 提供健康检查端点（返回 `ok`）。
