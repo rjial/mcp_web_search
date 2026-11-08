@@ -1,5 +1,5 @@
 playwright>=1.40.0
-mcp>=1.26.0
+mcp>=2,<3
 aiofiles>=23.0.0
 python-dotenv>=1.0.0
 openai>=2.0.0
@@ -17,3 +17,8 @@ playwright-stealth>=1.0.0
 psutil>=5.9.0
 fastapi>=0.95.0
 uvicorn>=0.22.0
+
+# Optional: external agent-browser backend for get-webpage-markdown
+# (backend="agent-browser"). Not a pip package — install the Node CLI:
+#   npm i -g agent-browser && agent-browser install
+# Override the binary path with the AGENT_BROWSER_BIN env var if needed.

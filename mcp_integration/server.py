@@ -16,9 +16,16 @@ from pathlib import Path
 from typing import Any, Dict, List
 from dataclasses import asdict
 
-from mcp.server import Server
+from mcp.server import Server, ServerRequestContext
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import (
+    Tool,
+    TextContent,
+    ListToolsResult,
+    CallToolResult,
+    CallToolRequestParams,
+    PaginatedRequestParams,
+)
 
 from google_search.engine import google_search, get_google_search_page_html
 from google_search.browser_manager import BrowserManager, MAX_CONCURRENT_CRAWLS
@@ -34,6 +41,7 @@ _POLITENESS_DELAY_SECONDS: float = 2.0
 # Per-domain locks to serialize requests to the same host
 _domain_locks: Dict[str, asyncio.Lock] = {}
 from google_search.distiller import ContentDistiller
+from google_search.agent_browser_backend import fetch_markdown_via_agent_browser
 from google_search.search_executor import SearchExecutor
 from google_search.utils import safe_stop_playwright, safe_close_context, safe_close_page
 from common.types import CommandOptions, SavedState
@@ -45,9 +53,8 @@ os.environ.setdefault("LANG", "en_US.UTF-8")
 os.environ.setdefault("LC_ALL", "en_US.UTF-8")
 
 
-# 创建MCP服务器实例
-# Create MCP server instance
-server = Server("google-search-server")
+# The MCP server instance is created after the handlers are defined (mcp 2.x
+# wires handlers via constructor kwargs instead of decorators). See bottom.
 
 # Cooldown tracking to avoid rapid repeated searches after CAPTCHA
 # Timestamp (epoch seconds) of last detected CAPTCHA
@@ -56,12 +63,13 @@ _last_captcha_time: float = 0.0
 _captcha_cooldown_seconds: int = int(os.getenv("MCP_CAPTCHA_COOLDOWN", "90"))
 
 
-@server.list_tools()
-async def list_tools() -> List[Tool]:
+async def list_tools(
+    ctx: ServerRequestContext, params: PaginatedRequestParams | None
+) -> ListToolsResult:
     """注册可用的工具
     Register available tools
     """
-    return [
+    return ListToolsResult(tools=[
         Tool(
             name="google-search",
             description="使用Google搜索引擎查询实时网络信息，返回包含标题、链接和摘要的搜索结果。适用于需要获取最新信息、查找特定主题资料、研究当前事件或验证事实的场景。结果以JSON格式返回，包含查询内容和匹配结果列表。",
@@ -122,6 +130,26 @@ async def list_tools() -> List[Tool]:
                     "timeout": {"type": "number", "description": "导航/提取超时时间(毫秒)", "default": 60000},
                     "saveScreenshot": {"type": "boolean", "description": "是否保存页面截图", "default": True},
                     "outputPath": {"type": "string", "description": "可选的截图输出路径（文件或目录）"},
+                    "backend": {
+                        "type": "string",
+                        "enum": ["playwright", "agent-browser"],
+                        "description": (
+                            "Page-fetching backend. 'playwright' (default) uses the built-in "
+                            "stealth Playwright + Crawl4AI distiller. 'agent-browser' shells out "
+                            "to the external agent-browser CLI (Chrome over CDP); requires the "
+                            "binary on PATH (npm i -g agent-browser && agent-browser install)."
+                        ),
+                        "default": "playwright",
+                    },
+                    "renderJs": {
+                        "type": "boolean",
+                        "description": (
+                            "agent-browser backend only: launch Chrome so JavaScript runs "
+                            "(open + read). When False, uses the lighter HTTP-only read path. "
+                            "Ignored by the playwright backend."
+                        ),
+                        "default": True,
+                    },
                 },
                 "required": ["url"],
             },
@@ -177,11 +205,15 @@ async def list_tools() -> List[Tool]:
                 "required": ["query"],
             },
         ),
-    ]
+    ])
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
+async def _dispatch_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
+    """Dispatch a tool call and return its content blocks.
+
+    Keeps the v1 behavior of returning text content (including JSON error
+    payloads) rather than raising, so callers get a result either way.
+    """
     try:
         if name == "google-search":
             query = arguments.get("query", "")
@@ -307,7 +339,29 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
             if not url:
                 return [TextContent(type="text", text=json.dumps({"error": "url 不能为空"}, ensure_ascii=False))]
 
-            logger.info(f"收到网页提炼请求: url={url}, query={query}, timeout={timeout}")
+            backend = str(arguments.get("backend", "playwright")).lower()
+            render_js = bool(arguments.get("renderJs", True))
+
+            logger.info(f"收到网页提炼请求: url={url}, query={query}, timeout={timeout}, backend={backend}")
+
+            # ── agent-browser backend: delegate to external CLI ──────────────
+            if backend == "agent-browser":
+                ab_result = await fetch_markdown_via_agent_browser(
+                    url, timeout=timeout, query=query, render=render_js
+                )
+                out = {
+                    "markdown": ab_result.get("markdown", ""),
+                    "metadata": {
+                        "title": ab_result.get("title", ""),
+                        "url": ab_result.get("url", url),
+                        "extraction_method": ab_result.get("method", "agent-browser"),
+                    },
+                    "screenshot_path": None,
+                }
+                if ab_result.get("error"):
+                    out["error"] = ab_result["error"]
+                logger.info(f"[INFO] agent-browser crawl completed for {url}")
+                return [TextContent(type="text", text=json.dumps(out, ensure_ascii=False))]
 
             # parse use_basic_view flag (support camelCase alias)
             use_basic_view = bool(arguments.get("use_basic_view", arguments.get("useBasicView", False)))
@@ -596,6 +650,35 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     except Exception as e:
         logger.error(f"工具调用失败: {e}")
         return [TextContent(type="text", text=f"工具调用失败: {str(e)}")]
+
+
+async def call_tool(
+    ctx: ServerRequestContext, params: CallToolRequestParams
+) -> CallToolResult:
+    """mcp 2.x call-tool handler.
+
+    In 2.x the SDK no longer wraps return values or converts handler exceptions
+    into error results, so we build the CallToolResult ourselves and keep the
+    v1 behavior of surfacing failures as text content.
+    """
+    name = params.name
+    arguments = params.arguments or {}
+    try:
+        content = await _dispatch_tool(name, arguments)
+    except Exception as e:
+        logger.error(f"工具调用失败: {e}")
+        content = [TextContent(type="text", text=f"工具调用失败: {str(e)}")]
+    return CallToolResult(content=content, is_error=False)
+
+
+# 创建MCP服务器实例 (handlers wired via constructor kwargs in mcp 2.x)
+# Create MCP server instance
+server = Server(
+    "google-search-server",
+    version="1.0.0",
+    on_list_tools=list_tools,
+    on_call_tool=call_tool,
+)
 
 
 async def main():
