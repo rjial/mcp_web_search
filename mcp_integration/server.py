@@ -739,10 +739,17 @@ def serve_sse():
     uvicorn.run(starlette_app, host=host, port=port)
 
 
-if __name__ == "__main__":
-    # If requested, run as an SSE/HTTP server. This path must be synchronous
-    # because `uvicorn.run()` starts its own event loop.
+def run():
+    """Synchronous console-script entry point.
+
+    Runs the SSE/HTTP server when MCP_SSE=1 (serve_sse manages its own event
+    loop), otherwise the stdio server under asyncio.
+    """
     if os.getenv("MCP_SSE", "0") == "1":
         serve_sse()
     else:
         asyncio.run(main())
+
+
+if __name__ == "__main__":
+    run()
