@@ -103,7 +103,19 @@ python cli.py --get-html "search keywords"
 
 # Get HTML and save to file
 python cli.py --get-html --save-html "search keywords"
+
+# Fetch a URL as Markdown (default playwright backend)
+python cli.py --markdown https://example.com
+
+# Fetch a URL as Markdown using the agent-browser backend
+python cli.py --markdown https://example.com --backend agent-browser
+
+# agent-browser, lighter HTTP-only fetch (no Chrome / no JS)
+python cli.py --markdown https://example.com --backend agent-browser --no-render-js
 ```
+
+When `--markdown` is given, the positional `query` becomes optional; if supplied,
+it is used as an intent/filter hint for the distiller.
 
 ### MCP Server
 
@@ -125,6 +137,9 @@ python -m mcp_integration.client
 - `--get-html`: Get raw HTML of search result page instead of parsed results
 - `--save-html`: Save HTML to file (use with --get-html)
 - `--html-output <path>`: Specify HTML output file path (use with --get-html and --save-html)
+- `--markdown <URL>`: Fetch the given URL and distill it to Markdown instead of searching
+- `--backend <playwright|agent-browser>`: Fetch backend for `--markdown` (default: playwright)
+- `--render-js / --no-render-js`: agent-browser backend only — launch Chrome so JS runs (default: on)
 - `-V, --version`: Show version number
 - `-h, --help`: Show help information
 

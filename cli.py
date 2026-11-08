@@ -33,7 +33,8 @@ async def main():
     )
 
     # 配置命令行选项  # Configure command line options
-    parser.add_argument("query", help="搜索关键词")
+    # query is optional when --markdown is used to fetch a specific URL.
+    parser.add_argument("query", nargs="?", help="搜索关键词 (search query); optional with --markdown")
     parser.add_argument("-l", "--limit", type=int, default=10, help="结果数量限制 (默认: 10)")
     parser.add_argument(
         "-t", "--timeout", type=int, default=30000, help="超时时间(毫秒) (默认: 30000)"
@@ -67,14 +68,81 @@ async def main():
     parser.add_argument("--save-html", action="store_true", help="将HTML保存到文件")
     parser.add_argument("--html-output", help="HTML输出文件路径")
     parser.add_argument(
+        "--markdown",
+        metavar="URL",
+        help="获取指定 URL 并提炼为 Markdown，而不是执行搜索 (fetch a URL as Markdown instead of searching)",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["playwright", "agent-browser"],
+        default="playwright",
+        help="--markdown 的抓取后端 (fetch backend for --markdown; default: playwright)",
+    )
+    parser.add_argument(
+        "--render-js",
+        dest="render_js",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="agent-browser 后端: 启动 Chrome 以执行 JS (launch Chrome so JS runs). 用 --no-render-js 关闭。",
+    )
+    parser.add_argument(
         "-V", "--version", action="version", version=f"%(prog)s {get_version()}"
     )
 
     # 解析命令行参数  # Parse command line arguments
     args = parser.parse_args()
 
+    if not args.markdown and not args.query:
+        parser.error("query is required unless --markdown URL is given")
+
     try:
-        if args.get_html:
+        if args.markdown:
+            url = args.markdown
+            if args.backend == "agent-browser":
+                from google_search.agent_browser_backend import (
+                    fetch_markdown_via_agent_browser,
+                )
+
+                result = await fetch_markdown_via_agent_browser(
+                    url,
+                    timeout=args.timeout,
+                    query=args.query,
+                    render=args.render_js,
+                )
+            else:
+                # playwright backend: navigate and distill, mirroring the server.
+                from google_search.browser_manager import BrowserManager
+                from google_search.distiller import ContentDistiller
+
+                bm = BrowserManager()
+                async with bm.get_page_context() as (context, page):
+                    await page.goto(url, timeout=args.timeout, wait_until="networkidle")
+                    distiller = ContentDistiller(context=context, page=page)
+                    distilled = await distiller.distill(
+                        url, query=args.query, basic_view=args.basic_view
+                    )
+                result = {
+                    "markdown": distilled.get("markdown", ""),
+                    "title": distilled.get("title", ""),
+                    "url": distilled.get("url", url),
+                    "method": distilled.get("method", "fallback"),
+                }
+
+            print(
+                json.dumps(
+                    {
+                        "url": result.get("url", url),
+                        "backend": args.backend,
+                        "method": result.get("method"),
+                        "title": result.get("title", ""),
+                        "markdown": result.get("markdown", ""),
+                        "error": result.get("error"),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+        elif args.get_html:
             # 获取HTML  # Get HTML
             html_result = await get_google_search_page_html(
                 args.query,
